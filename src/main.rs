@@ -1,7 +1,8 @@
-// Cargo.toml dependencies:
-// [dependencies]
-// clap = "4.0"
-// rust-htslib = "0.43"   // or the latest version available
+/*
+samtools view data/HLA-A_reads_ds.bam | head -n 1
+samtools view data/HLA-A_reads.snc.bam | head -n 2
+*/
+
 
 use clap::{Arg, Command};
 use rust_htslib::bam;
