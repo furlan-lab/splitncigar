@@ -1,6 +1,8 @@
 /*
 samtools view data/HLA-A_reads_ds.bam | head -n 1
 samtools view data/HLA-A_reads.snc.bam | head -n 2
+
+
 */
 
 
@@ -54,7 +56,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let input_path = matches.get_one::<String>("input").unwrap();
     let output_path = matches.get_one::<String>("output").unwrap();
-    let _reference_path = matches.get_one::<String>("reference").unwrap();
+    // Removed `_reference_path` as it is unused.
+    // let _reference_path = matches.get_one::<String>("reference").unwrap();
 
     let refactor_cigar_string = matches.get_flag("refactor_cigar_string");
     let skip_mq_transform = matches.get_flag("skip_mq_transform");
@@ -184,13 +187,6 @@ fn split_read_based_on_cigar(
         }
     }
 
-    // For the split section, count the number of reference bases.
-    let mut _ref_bases = 0;
-    for cig in &cigar_elements[cigar_first_index..cigar_second_index] {
-        if consumes_reference(cig.char()) {
-            _ref_bases += cig.len();
-        }
-    }
     // In this simplified version, we do not modify the sequence bases.
     // We simply update the CIGAR to include only the kept section.
     let new_cigar: Vec<bam::record::Cigar> = cigar_elements[cigar_first_index..cigar_second_index]
@@ -199,8 +195,13 @@ fn split_read_based_on_cigar(
         .collect();
 
     let mut new_record = record.clone();
-    // Note: `set_cigar` is assumed to be available in rust-htslib 0.43.
-    new_record.set_cigar(&new_cigar)?;
+    // Use `set` to update the CIGAR string and position.
+    new_record.set(
+        record.qname(),
+        Some(&bam::record::CigarString::from(new_cigar)),
+        &record.seq().as_bytes(),
+        record.qual(),
+    );
     new_record.set_pos(new_start);
 
     Ok(new_record)
