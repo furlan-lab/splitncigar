@@ -1,7 +1,9 @@
 /*
 samtools view data/HLA-A_reads_ds.bam | head -n 1
 samtools view data/HLA-A_reads.snc.bam | head -n 2
+cargo build --release
 
+cargo run --release -- -i data/HLA-A_reads_ds.bam -o data/HLA-A_reads.snc.bam -R 
 
 */
 
