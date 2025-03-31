@@ -1,10 +1,11 @@
 /*
+Clang/18.1.8-GCCcore-13.3.0
 samtools view data/HLA-A_reads_ds.bam | head -n 1
 samtools view data/HLA-A_reads.snc.bam | head -n 2
-cargo build --release
-
-cargo run --release -- -i data/HLA-A_reads_ds.bam -o data/HLA-A_reads.snc.bam -R 
-
+cargo build --release && cp ~/develop/splitncigar/target/release/splitncigar ~/.local/bin
+splitncigar --input data/HLA-A_reads_ds.bam --output HLA-A_reads.snc.bam --reference /fh/fast/furlan_s/grp/refs/GRCh38/GRCh38.p13.genome.fa
+samtools view HLA-A_reads.snc.bam | head -n 1
+rm HLA-A_reads.snc.bam
 */
 
 
