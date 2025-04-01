@@ -14,6 +14,7 @@ use clap::{Arg, Command};
 use rust_htslib::bam;
 use rust_htslib::bam::{Read, Record, Writer};
 use std::error::Error;
+use std::io::{stdin, stdout, Write}; // for reading user input & flushing
 
 fn main() -> Result<(), Box<dyn Error>> {
     let matches = Command::new("split_ncigar_reads")
@@ -56,21 +57,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .help("Skip the mapping quality 255 -> 60 transformation")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("debug_splits")
+                .long("debug-splits")
+                .help("Print debug info for each read and then prompt user to press Enter or 'q'.")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     let input_path = matches.get_one::<String>("input").unwrap();
     let output_path = matches.get_one::<String>("output").unwrap();
-    // Removed `_reference_path` as it is unused.
-    // let _reference_path = matches.get_one::<String>("reference").unwrap();
+    // let reference_path = matches.get_one::<String>("reference").unwrap(); // not used below
 
     let refactor_cigar_string = matches.get_flag("refactor_cigar_string");
     let skip_mq_transform = matches.get_flag("skip_mq_transform");
+    let debug_splits = matches.get_flag("debug_splits");
 
     // Open the input BAM and create the writer using its header.
     let mut bam_reader = bam::Reader::from_path(input_path)?;
     let header = bam::Header::from_template(bam_reader.header());
-    let mut bam_writer =
-        Writer::from_path(output_path, &header, bam::Format::Bam)?;
+    let mut bam_writer = Writer::from_path(output_path, &header, bam::Format::Bam)?;
 
     // Process each read record.
     for result in bam_reader.records() {
@@ -81,10 +87,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             record.set_mapq(60);
         }
 
-        // Optionally refactor the CIGAR string.
+        // Optionally refactor the CIGAR string (stub).
         if refactor_cigar_string {
-            // This is a stub. In a complete implementation you might merge adjacent N-D-N segments.
-            // For now, we simply leave the CIGAR unmodified.
+            // In a complete implementation, you might merge adjacent N-D-N segments, etc.
+        }
+
+        // Debug: print the original read before splitting.
+        if debug_splits {
+            eprintln!(
+                "[DEBUG] Original read: QNAME={}, pos={}, seq_len={}, CIGAR={}",
+                String::from_utf8_lossy(record.qname()),
+                record.pos(),
+                record.seq().len(),
+                record.cigar().to_string()
+            );
         }
 
         // Split the read if it contains N operators.
@@ -95,13 +111,48 @@ fn main() -> Result<(), Box<dyn Error>> {
             repair_supplementary_tags(&mut split_records);
         }
 
+        // Debug: print info about the splitted records if more than one.
+        if debug_splits && split_records.len() > 1 {
+            eprintln!("    -> splitted into {} records:", split_records.len());
+            for (i, rec) in split_records.iter().enumerate() {
+                eprintln!(
+                    "       split#{}: QNAME={}, pos={}, seq_len={}, CIGAR={}",
+                    i,
+                    String::from_utf8_lossy(rec.qname()),
+                    rec.pos(),
+                    rec.seq().len(),
+                    rec.cigar().to_string()
+                );
+            }
+        }
+
         // Write out each resulting record.
         for rec in split_records {
             bam_writer.write(&rec)?;
         }
+
+        // If debugging, prompt user to continue or quit after this read’s debug info.
+        if debug_splits {
+            let should_quit = pause_for_debug()?;
+            if should_quit {
+                eprintln!("User quit debug mode. Stopping early...");
+                break; // stops reading/writing the rest of the file
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Prompt user to press Enter to continue or 'q' to quit.
+/// Returns `true` if user typed 'q', otherwise `false`.
+fn pause_for_debug() -> Result<bool, Box<dyn Error>> {
+    eprint!("Press Enter to continue, or 'q' then Enter to quit: ");
+    stdout().flush()?; // ensure the prompt is displayed immediately
+
+    let mut input = String::new();
+    stdin().read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("q"))
 }
 
 /// Splits a read into one or more records if its CIGAR string contains N operators.
@@ -147,6 +198,7 @@ fn split_ncigar_read(record: &Record) -> Result<Vec<Record>, Box<dyn Error>> {
     }
     Ok(split_records)
 }
+
 /// Creates a new record by “clipping” the input record to the region defined by
 /// the CIGAR elements between `cigar_start_index` and `cigar_end_index`.
 /// This function adjusts the CIGAR, the alignment start position,
@@ -213,7 +265,6 @@ fn split_read_based_on_cigar(
     // 5) Slice the read’s sequence and quality accordingly.
     let full_seq = record.seq().as_bytes();
     let full_qual = record.qual();
-    // Make sure we don’t run out of bounds.
     if skipped_query_bases + subrange_query_bases > full_seq.len() {
         return Err(format!(
             "Mismatch splitting read: skipping {} + subrange {} > seq len {}",
@@ -224,8 +275,8 @@ fn split_read_based_on_cigar(
         .into());
     }
 
-    let new_seq = &full_seq[skipped_query_bases..(skipped_query_bases + subrange_query_bases)];
-    let new_qual = &full_qual[skipped_query_bases..(skipped_query_bases + subrange_query_bases)];
+    let new_seq = &full_seq[skipped_query_bases..skipped_query_bases + subrange_query_bases];
+    let new_qual = &full_qual[skipped_query_bases..skipped_query_bases + subrange_query_bases];
 
     // 6) Create the new record from the old record. Then set the new CIGAR, new pos, and new sequence.
     let mut new_record = record.clone();
@@ -245,11 +296,11 @@ fn consumes_reference(op: char) -> bool {
     matches!(op, 'M' | 'D' | 'N' | '=' | 'X')
 }
 
-/// Include `S` in the query-consuming set:
+/// Returns true if the operator consumes query bases.
+/// Include `S` so soft-clipped bases are counted in the read length.
 fn consumes_query(op: char) -> bool {
     matches!(op, 'M' | 'I' | 'S' | '=' | 'X')
 }
-
 
 /// Clears certain auxiliary tags and marks non-primary split reads as supplementary.
 fn repair_supplementary_tags(records: &mut Vec<Record>) {
@@ -257,7 +308,6 @@ fn repair_supplementary_tags(records: &mut Vec<Record>) {
     let tags_to_remove = [b"NM", b"MD", b"NH"];
     for record in records.iter_mut() {
         for tag in &tags_to_remove {
-            // Remove the auxiliary field; ignore errors if not present.
             let _ = record.remove_aux(*tag);
         }
     }
@@ -265,8 +315,7 @@ fn repair_supplementary_tags(records: &mut Vec<Record>) {
     if records.len() > 1 {
         for record in records.iter_mut().skip(1) {
             let flags = record.flags();
-            // Set the supplementary flag (0x800).
-            record.set_flags(flags | 0x800);
+            record.set_flags(flags | 0x800); // 0x800 is the supplementary flag
         }
     }
 }
