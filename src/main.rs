@@ -1,8 +1,9 @@
 /*
-Clang/18.1.8-GCCcore-13.3.0
+ml Clang/18.1.8-GCCcore-13.3.0
 samtools view data/HLA-A_reads_ds.bam | head -n 1
 samtools view data/HLA-A_reads.snc.bam | head -n 2
-cargo build --release && cp ~/develop/splitncigar/target/release/splitncigar ~/.local/bin
+cargo build --release && cp ~/develop/splitncigar/target/release/splitncigar ~/.local/bin/splitncigar
+hg38=/Users/sfurlan/refs/GRCh38/GRCh38.p13.genome.fa
 splitncigar --input data/HLA-A_reads_ds.bam --output HLA-A_reads.snc.bam --reference /fh/fast/furlan_s/grp/refs/GRCh38/GRCh38.p13.genome.fa
 samtools view HLA-A_reads.snc.bam | head -n 1
 rm HLA-A_reads.snc.bam
@@ -146,74 +147,109 @@ fn split_ncigar_read(record: &Record) -> Result<Vec<Record>, Box<dyn Error>> {
     }
     Ok(split_records)
 }
-
 /// Creates a new record by “clipping” the input record to the region defined by
 /// the CIGAR elements between `cigar_start_index` and `cigar_end_index`.
-///
-/// This function adjusts the CIGAR and the alignment start position accordingly.
-/// (For simplicity, the base sequence and qualities are not modified here.)
+/// This function adjusts the CIGAR, the alignment start position,
+/// and also the read bases + quality arrays.
 fn split_read_based_on_cigar(
     record: &Record,
     cigar_start_index: usize,
     cigar_end_index: usize,
 ) -> Result<Record, Box<dyn Error>> {
-    let cigar = record.cigar();
-    let cigar_elements: Vec<_> = cigar.iter().collect();
-    let mut cigar_first_index = cigar_start_index;
-    let mut cigar_second_index = cigar_end_index;
+    let original_cigar = record.cigar();
+    let cigar_elements: Vec<_> = original_cigar.iter().collect();
 
-    // In case a section starts or ends with D, trim these operators.
-    while cigar_first_index < cigar_elements.len() && cigar_elements[cigar_first_index].char() == 'D'
-    {
-        cigar_first_index += 1;
+    // 1) Adjust start/end so that we skip leading or trailing D in this subset.
+    let mut start = cigar_start_index;
+    let mut end = cigar_end_index;
+    while start < cigar_elements.len() && cigar_elements[start].char() == 'D' {
+        start += 1;
     }
-    while cigar_second_index > cigar_first_index
-        && cigar_elements[cigar_second_index - 1].char() == 'D'
-    {
-        cigar_second_index -= 1;
+    while end > start && cigar_elements[end - 1].char() == 'D' {
+        end -= 1;
     }
-    if cigar_first_index > cigar_second_index {
+    if start >= end {
         return Err(format!(
-            "Cannot split this read (might be an empty section between Ns): {}",
+            "Empty section between Ns in CIGAR: {}",
             record.cigar().to_string()
         )
         .into());
     }
 
-    // Compute the new alignment start position.
-    // In BAM, pos is 0-based.
+    // 2) Compute the new alignment start.
+    // In BAM, `pos()` is 0-based. For each reference-consuming operator
+    // before `start`, add up the operator lengths to shift the alignment.
     let mut new_start = record.pos();
-    // Sum the reference-consuming operations in the prefix.
-    for cig in &cigar_elements[0..cigar_first_index] {
+    let prefix = &cigar_elements[0..start];
+    for cig in prefix {
         if consumes_reference(cig.char()) {
             new_start += cig.len() as i64;
         }
     }
 
-    // In this simplified version, we do not modify the sequence bases.
-    // We simply update the CIGAR to include only the kept section.
-    let new_cigar: Vec<bam::record::Cigar> = cigar_elements[cigar_first_index..cigar_second_index]
+    // 3) Build the sub-CIGAR by taking the slice [start..end].
+    let new_cigar: Vec<bam::record::Cigar> = cigar_elements[start..end]
         .iter()
         .map(|&c| c.clone())
         .collect();
 
+    // 4) Figure out how many query bases we skip in the prefix (so we can trim the sequence).
+    //    We also need to know how many query bases are in this subrange,
+    //    so we can slice out exactly that part of the read.
+    let mut skipped_query_bases = 0;
+    for cig in &cigar_elements[0..start] {
+        if consumes_query(cig.char()) {
+            skipped_query_bases += cig.len() as usize;
+        }
+    }
+
+    let mut subrange_query_bases = 0;
+    for cig in &cigar_elements[start..end] {
+        if consumes_query(cig.char()) {
+            subrange_query_bases += cig.len() as usize;
+        }
+    }
+
+    // 5) Slice the read’s sequence and quality accordingly.
+    let full_seq = record.seq().as_bytes();
+    let full_qual = record.qual();
+    // Make sure we don’t run out of bounds.
+    if skipped_query_bases + subrange_query_bases > full_seq.len() {
+        return Err(format!(
+            "Mismatch splitting read: skipping {} + subrange {} > seq len {}",
+            skipped_query_bases,
+            subrange_query_bases,
+            full_seq.len()
+        )
+        .into());
+    }
+
+    let new_seq = &full_seq[skipped_query_bases..(skipped_query_bases + subrange_query_bases)];
+    let new_qual = &full_qual[skipped_query_bases..(skipped_query_bases + subrange_query_bases)];
+
+    // 6) Create the new record from the old record. Then set the new CIGAR, new pos, and new sequence.
     let mut new_record = record.clone();
-    // Use `set` to update the CIGAR string and position.
     new_record.set(
         record.qname(),
         Some(&bam::record::CigarString::from(new_cigar)),
-        &record.seq().as_bytes(),
-        record.qual(),
+        new_seq,
+        new_qual,
     );
     new_record.set_pos(new_start);
 
     Ok(new_record)
 }
 
-/// Returns true if the CIGAR operator consumes reference bases.
+/// Returns true if the operator consumes reference bases.
 fn consumes_reference(op: char) -> bool {
     matches!(op, 'M' | 'D' | 'N' | '=' | 'X')
 }
+
+/// Include `S` in the query-consuming set:
+fn consumes_query(op: char) -> bool {
+    matches!(op, 'M' | 'I' | 'S' | '=' | 'X')
+}
+
 
 /// Clears certain auxiliary tags and marks non-primary split reads as supplementary.
 fn repair_supplementary_tags(records: &mut Vec<Record>) {
