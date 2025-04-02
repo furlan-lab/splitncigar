@@ -20,21 +20,20 @@ bamsummary data/HLA-A_reads.snc.snc_fc.bam
 rm HLA-A_reads*
 */
 
+
 use clap::{Arg, Command};
+use rayon::prelude::*;
 use rust_htslib::bam;
 use rust_htslib::bam::{Read, Writer};
 use rust_htslib::bam::record::Aux;
 use std::error::Error;
-use std::io::{stdin, stdout, Write}; // for reading user input & flushing
+use std::io::{stdin, stdout, Write};
 
 /// Control how we handle an existing SA tag when adding new sub-alignments.
 #[derive(Debug, Clone, Copy)]
 enum SaTagMode {
-    /// Remove any old SA, then write only your new subalignments.
     Overwrite,
-    /// Parse + merge with old SA (avoid duplicates, etc.).
     Merge,
-    /// If the record already has SA, keep it. If not, add your new ones.
     Preserve,
 }
 
@@ -42,12 +41,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let matches = Command::new("split_ncigar_reads")
         .version("0.1")
         .author("Your Name")
-        .about("Splits reads with N in the CIGAR string (spliced reads).")
+        .about("Splits reads with N in the CIGAR string (spliced reads) by chromosome.")
         .arg(
             Arg::new("input")
                 .short('i')
                 .long("input")
-                .help("Input BAM file")
+                .help("Input BAM file (sorted and indexed)")
                 .num_args(1)
                 .required(true),
         )
@@ -55,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Arg::new("output")
                 .short('o')
                 .long("output")
-                .help("Output BAM file")
+                .help("Output (unsorted) BAM file")
                 .num_args(1)
                 .required(true),
         )
@@ -82,37 +81,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         .arg(
             Arg::new("debug_splits")
                 .long("debug-splits")
-                .help("Print debug info for each read and prompt for user input.")
+                .help("Print debug info and process sequentially")
                 .action(clap::ArgAction::SetTrue),
         )
-        // Option to disable flag correction.
         .arg(
             Arg::new("no_flag_correction")
                 .long("no-flag-correction")
                 .help("Disable flag correction (default: enabled)")
                 .action(clap::ArgAction::SetTrue),
         )
-        // New: Option to choose how to handle SA tags.
         .arg(
             Arg::new("sa_mode")
                 .long("sa-mode")
-                .help("Specify how to handle SA tags: overwrite, merge, or preserve (default: merge)")
+                .help("How to handle SA tags: overwrite, merge, or preserve (default: merge)")
                 .num_args(1)
                 .default_value("merge"),
+        )
+        .arg(
+            Arg::new("threads")
+                .long("threads")
+                .help("Number of cores to use (default: 1)")
+                .num_args(1)
+                .default_value("1"),
         )
         .get_matches();
 
     let input_path = matches.get_one::<String>("input").unwrap();
     let output_path = matches.get_one::<String>("output").unwrap();
-    // let reference_path = matches.get_one::<String>("reference").unwrap(); // Not used in code below.
+    let _reference = matches.get_one::<String>("reference").unwrap();
 
     let refactor_cigar_string = matches.get_flag("refactor_cigar_string");
     let skip_mq_transform = matches.get_flag("skip_mq_transform");
     let debug_splits = matches.get_flag("debug_splits");
-    // Determine whether to perform flag correction (enabled by default).
     let flag_correction = !matches.get_flag("no_flag_correction");
 
-    // Parse the SA mode from command line.
+    // Parse SA mode.
     let sa_mode_str = matches.get_one::<String>("sa_mode").unwrap().to_lowercase();
     let sa_mode = match sa_mode_str.as_str() {
         "overwrite" => SaTagMode::Overwrite,
@@ -124,107 +127,152 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    // Open the input BAM.
+    // Parse number of threads.
+    let threads: usize = matches.get_one::<String>("threads").unwrap().parse()?;
+
+    // Open a BAM reader to retrieve header and target names.
     let mut bam_reader = bam::Reader::from_path(input_path)?;
     let header = bam::Header::from_template(bam_reader.header());
     let headerview = bam::HeaderView::from_header(&header);
+    let target_names: Vec<String> = headerview
+        .target_names()
+        .iter()
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .collect();
+
+    // Process each chromosome. If debug mode is enabled or only one thread is used, process sequentially.
+    let processed: Vec<Vec<bam::Record>> = if debug_splits || threads == 1 {
+        target_names
+            .iter()
+            .map(|chrom| {
+                process_chromosome(
+                    input_path,
+                    chrom,
+                    &headerview,
+                    flag_correction,
+                    refactor_cigar_string,
+                    skip_mq_transform,
+                    debug_splits,
+                    sa_mode,
+                )
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?
+    } else {
+        // Build a thread pool with the requested number of threads.
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
+        pool.install(|| {
+            target_names
+                .par_iter()
+                .map(|chrom| {
+                    process_chromosome(
+                        input_path,
+                        chrom,
+                        &headerview,
+                        flag_correction,
+                        refactor_cigar_string,
+                        skip_mq_transform,
+                        debug_splits,
+                        sa_mode,
+                    )
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()
+        })?
+    };
+
+    // Open a writer for the single output (unsorted) BAM file.
     let mut bam_writer = Writer::from_path(output_path, &header, bam::Format::Bam)?;
-
-    // Process each read record.
-    for result in bam_reader.records() {
-        let mut record = result?;
-
-        // Optionally apply the mapping quality transform (255 -> 60).
-        if !skip_mq_transform && record.mapq() == 255 {
-            record.set_mapq(60);
-        }
-
-        // Optionally refactor the CIGAR (placeholder).
-        if refactor_cigar_string {
-            // e.g. merging adjacent N-D-N segments if needed.
-        }
-
-        // Debug: print the original read.
-        if debug_splits {
-            eprintln!(
-                "[DEBUG] Original read:\n  QNAME={}\n  pos={}\n  seq_len={}\n  CIGAR={}\n  seq={}",
-                String::from_utf8_lossy(record.qname()),
-                record.pos(),
-                record.seq().len(),
-                record.cigar().to_string(),
-                decode_seq(&record)
-            );
-        }
-
-        // Save the original flag from the unsplit record.
-        let orig_flag = record.flags();
-
-        // Split the read if it has N operators.
-        let mut split_records = split_ncigar_read(&record)?;
-
-        // If flag correction is enabled (default), then override the flags
-        // of each split record with the original flag.
-        if flag_correction {
-            for rec in split_records.iter_mut() {
-                rec.set_flags(orig_flag);
-            }
-        }
-
-        // If multiple subreads, mark them supplementary and set SA:Z.
-        if split_records.len() > 1 {
-            repair_supplementary_tags(&mut split_records);
-
-            // Obtain reference name from tid.
-            let rname = tid_to_refname(&headerview, record.tid());
-
-            // Build and add sub-alignments using the chosen SA mode.
-            annotate_sa_tag(&mut split_records, &rname, sa_mode)?;
-        }
-
-        // Debug: print splitted records if more than one.
-        if debug_splits && split_records.len() > 1 {
-            eprintln!("    -> splitted into {} records:", split_records.len());
-            for (i, rec) in split_records.iter().enumerate() {
-                eprintln!(
-                    "       split#{}:\n         QNAME={}\n         pos={}\n         seq_len={}\n         CIGAR={}\n         seq={}",
-                    i,
-                    String::from_utf8_lossy(rec.qname()),
-                    rec.pos(),
-                    rec.seq().len(),
-                    rec.cigar().to_string(),
-                    decode_seq(rec)
-                );
-            }
-        }
-
-        // Write out each subrecord.
-        for rec in split_records {
+    // Write all processed records (order is not guaranteed).
+    for record_vec in processed {
+        for rec in record_vec {
             bam_writer.write(&rec)?;
-        }
-
-        // If debugging, prompt user for 'q' or Enter.
-        if debug_splits {
-            let should_quit = pause_for_debug()?;
-            if should_quit {
-                eprintln!("User quit debug mode. Stopping early...");
-                break;
-            }
         }
     }
 
+    println!("Output written to {} (unsorted)", output_path);
+    println!("You can sort the BAM file afterwards (e.g., using samtools sort).");
     Ok(())
 }
 
-/// Prompt user to press Enter to continue, or 'q' to quit. 
-fn pause_for_debug() -> Result<bool, Box<dyn Error>> {
-    eprint!("Press Enter to continue, or 'q' then Enter to quit: ");
-    stdout().flush()?; 
-    let mut input = String::new();
-    stdin().read_line(&mut input)?;
-    Ok(input.trim().eq_ignore_ascii_case("q"))
+/// Process all records for a given chromosome using an IndexedReader.
+/// Returns a vector of processed (split) records.
+fn process_chromosome(
+    input_path: &str,
+    chrom: &str,
+    headerview: &bam::HeaderView,
+    flag_correction: bool,
+    refactor_cigar_string: bool,
+    skip_mq_transform: bool,
+    debug_splits: bool,
+    sa_mode: SaTagMode,
+) -> Result<Vec<bam::Record>, Box<dyn Error>> {
+    // Open an IndexedReader (the BAM must be sorted and indexed).
+    let mut idx_reader = bam::IndexedReader::from_path(input_path)?;
+    // Fetch all records for the given chromosome.
+    idx_reader.fetch(chrom, 0, None)?;
+
+    let mut processed_records = Vec::new();
+    for result in idx_reader.records() {
+        let mut record = result?;
+        let processed = process_record(
+            &mut record,
+            flag_correction,
+            refactor_cigar_string,
+            skip_mq_transform,
+            debug_splits,
+            headerview,
+            sa_mode,
+        )?;
+        processed_records.extend(processed);
+    }
+    Ok(processed_records)
 }
 
-/// If tid < 0 or out-of-range, return "*", else return the actual ref name.
+/// Process a single record: transform MAPQ, optionally refactor CIGAR,
+/// split the read, correct flags, and annotate SA tags.
+fn process_record(
+    record: &mut bam::Record,
+    flag_correction: bool,
+    _refactor_cigar_string: bool, // placeholder for future CIGAR refactoring
+    skip_mq_transform: bool,
+    debug_splits: bool,
+    headerview: &bam::HeaderView,
+    sa_mode: SaTagMode,
+) -> Result<Vec<bam::Record>, Box<dyn Error>> {
+    if !skip_mq_transform && record.mapq() == 255 {
+        record.set_mapq(60);
+    }
+    if _refactor_cigar_string {
+        // Insert any desired CIGAR refactoring logic here.
+    }
+    if debug_splits {
+        eprintln!(
+            "[DEBUG] Original read:\n  QNAME={}\n  pos={}\n  seq_len={}\n  CIGAR={}\n  seq={}",
+            String::from_utf8_lossy(record.qname()),
+            record.pos(),
+            record.seq().len(),
+            record.cigar().to_string(),
+            decode_seq(record)
+        );
+    }
+    let orig_flag = record.flags();
+    let mut split_records = split_ncigar_read(record)?;
+    if flag_correction {
+        for rec in split_records.iter_mut() {
+            rec.set_flags(orig_flag);
+        }
+    }
+    if split_records.len() > 1 {
+        repair_supplementary_tags(&mut split_records);
+        let rname = tid_to_refname(headerview, record.tid());
+        annotate_sa_tag(&mut split_records, &rname, sa_mode)?;
+    }
+    if debug_splits && split_records.len() > 1 {
+        eprintln!("    -> split into {} records", split_records.len());
+    }
+    Ok(split_records)
+}
+
+/// Return the reference name for a given tid.
 fn tid_to_refname(header_view: &bam::HeaderView, tid: i32) -> String {
     if tid < 0 {
         return "*".to_string();
@@ -233,16 +281,16 @@ fn tid_to_refname(header_view: &bam::HeaderView, tid: i32) -> String {
     if idx >= header_view.target_count() {
         return "*".to_string();
     }
-    let bytes: &[u8] = header_view.tid2name(idx);
+    let bytes = header_view.tid2name(idx);
     String::from_utf8_lossy(bytes).to_string()
 }
 
-/// Convert a read's 4-bit or ASCII-coded bases into a String.
+/// Convert a read's sequence into a String.
 fn decode_seq(record: &bam::Record) -> String {
     String::from_utf8_lossy(&record.seq().as_bytes()).to_string()
 }
 
-/// If the read's CIGAR has 'N', create multiple subrecords. 
+/// Splits a read with 'N' operators in its CIGAR string into subrecords.
 fn split_ncigar_read(record: &bam::Record) -> Result<Vec<bam::Record>, Box<dyn Error>> {
     let cigar = record.cigar();
     let cigar_elems: Vec<_> = cigar.iter().collect();
@@ -256,11 +304,9 @@ fn split_ncigar_read(record: &bam::Record) -> Result<Vec<bam::Record>, Box<dyn E
     if !has_n {
         return Ok(vec![record.clone()]);
     }
-
     let mut splits = Vec::new();
     let mut section_has_match = false;
     let mut start_idx = 0;
-
     for (i, c) in cigar_elems.iter().enumerate() {
         let op = c.char();
         if matches!(op, 'M' | '=' | 'X' | 'I' | 'D') {
@@ -275,7 +321,6 @@ fn split_ncigar_read(record: &bam::Record) -> Result<Vec<bam::Record>, Box<dyn E
             section_has_match = false;
         }
     }
-    // last chunk
     if section_has_match && start_idx < cigar_elems.len() {
         let split = split_read_softclip(record, start_idx, cigar_elems.len())?;
         splits.push(split);
@@ -283,7 +328,7 @@ fn split_ncigar_read(record: &bam::Record) -> Result<Vec<bam::Record>, Box<dyn E
     Ok(splits)
 }
 
-/// Soft-clip outside the subrange [cigar_start_index..cigar_end_index].
+/// Creates a subrecord by soft-clipping outside the specified CIGAR subrange.
 fn split_read_softclip(
     record: &bam::Record,
     cigar_start: usize,
@@ -291,8 +336,6 @@ fn split_read_softclip(
 ) -> Result<bam::Record, Box<dyn Error>> {
     let binding = record.cigar();
     let cigar_elems: Vec<_> = binding.into_iter().collect();
-
-    // skip leading/trailing 'D' in subrange
     let mut start = cigar_start;
     let mut end = cigar_end;
     while start < end && cigar_elems[start].char() == 'D' {
@@ -308,39 +351,29 @@ fn split_read_softclip(
         )
         .into());
     }
-
-    // alignment start
     let mut new_start = record.pos();
     for c in &cigar_elems[0..start] {
         if consumes_reference(c.char()) {
             new_start += c.len() as i64;
         }
     }
-
-    // collect middle portion
     let sub_ops: Vec<bam::record::Cigar> = cigar_elems[start..end]
         .iter()
         .map(|&c| c.clone())
         .collect();
-
-    // figure out how many bases in prefix, subrange
-    let mut prefix_qbases = 0;
-    for c in &cigar_elems[0..start] {
-        if consumes_query(c.char()) {
-            prefix_qbases += c.len() as usize;
-        }
-    }
-    let mut middle_qbases = 0;
-    for c in &cigar_elems[start..end] {
-        if consumes_query(c.char()) {
-            middle_qbases += c.len() as usize;
-        }
-    }
+    let prefix_qbases: usize = cigar_elems[0..start]
+        .iter()
+        .filter(|c| consumes_query(c.char()))
+        .map(|c| c.len() as usize)
+        .sum();
+    let middle_qbases: usize = cigar_elems[start..end]
+        .iter()
+        .filter(|c| consumes_query(c.char()))
+        .map(|c| c.len() as usize)
+        .sum();
     let total_len = record.seq().len();
     let leading_s = prefix_qbases;
     let trailing_s = total_len.saturating_sub(leading_s + middle_qbases);
-
-    // new CIGAR
     let mut new_ops = Vec::new();
     if leading_s > 0 {
         new_ops.push(bam::record::Cigar::SoftClip(leading_s as u32));
@@ -349,8 +382,6 @@ fn split_read_softclip(
     if trailing_s > 0 {
         new_ops.push(bam::record::Cigar::SoftClip(trailing_s as u32));
     }
-
-    // build a new record
     let mut new_rec = record.clone();
     new_rec.set_pos(new_start);
     new_rec.set(
@@ -359,21 +390,20 @@ fn split_read_softclip(
         &record.seq().as_bytes(),
         record.qual(),
     );
-
     Ok(new_rec)
 }
 
-/// returns true if the operator consumes reference
+/// Returns true if the CIGAR operator consumes reference.
 fn consumes_reference(op: char) -> bool {
     matches!(op, 'M' | 'D' | 'N' | '=' | 'X')
 }
 
-/// returns true if the operator consumes query
+/// Returns true if the CIGAR operator consumes query.
 fn consumes_query(op: char) -> bool {
     matches!(op, 'M' | 'I' | 'S' | '=' | 'X')
 }
 
-/// remove NM, MD, NH and set 0x800 on non-primary
+/// Remove NM, MD, NH tags and mark non-primary (supplementary) records.
 fn repair_supplementary_tags(records: &mut [bam::Record]) {
     let remove_tags = [b"NM", b"MD", b"NH"];
     for rec in records.iter_mut() {
@@ -384,12 +414,12 @@ fn repair_supplementary_tags(records: &mut [bam::Record]) {
     if records.len() > 1 {
         for rec in records.iter_mut().skip(1) {
             let f = rec.flags();
-            rec.set_flags(f | 0x800); // supplementary flag
+            rec.set_flags(f | 0x800);
         }
     }
 }
 
-/// Decide how to handle the existing SA tag.
+/// Annotate records with an SA tag containing sub-alignments.
 fn annotate_sa_tag(
     records: &mut [bam::Record],
     rname: &str,
@@ -398,8 +428,6 @@ fn annotate_sa_tag(
     if records.len() < 2 {
         return Ok(());
     }
-
-    // Build new sub-align lines for each record.
     let sub_aligns: Vec<String> = records
         .iter()
         .map(|rec| {
@@ -407,40 +435,34 @@ fn annotate_sa_tag(
             let strand = if (rec.flags() & 0x10) != 0 { '-' } else { '+' };
             let cigar_str = rec.cigar().to_string();
             let mapq = rec.mapq();
-            let nm = 0; // or parse rec.aux(b"NM")
+            let nm = 0;
             format!("{},{},{},{},{},{}", rname, pos1, strand, cigar_str, mapq, nm)
         })
         .collect();
-
-    // For each record, gather sub-align lines of the *other* split records.
     for (i, rec) in records.iter_mut().enumerate() {
-        let mut new_entries = Vec::new();
-        for (j, sa) in sub_aligns.iter().enumerate() {
-            if j != i {
-                new_entries.push(sa.clone());
-            }
-        }
+        let new_entries: Vec<String> = sub_aligns
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, sa)| sa.clone())
+            .collect();
         handle_sa_tag(rec, &new_entries, sa_mode)?;
     }
-
     Ok(())
 }
 
-/// Actually handle Overwrite, Merge, or Preserve existing SA:Z.
+/// Handle the SA tag according to the specified mode.
 fn handle_sa_tag(
     rec: &mut bam::Record,
     new_subaligns: &[String],
     mode: SaTagMode,
 ) -> Result<(), Box<dyn Error>> {
-    // fetch existing SA if any.
     let old_sa = match rec.aux(b"SA") {
         Ok(Aux::String(s)) => s.to_string(),
         _ => String::new(),
     };
-
     match mode {
         SaTagMode::Overwrite => {
-            // Remove old, then write new.
             let _ = rec.remove_aux(b"SA");
             if !new_subaligns.is_empty() {
                 let mut merged = new_subaligns.join(";");
@@ -449,7 +471,6 @@ fn handle_sa_tag(
             }
         }
         SaTagMode::Preserve => {
-            // If old SA is present, do nothing; else add new.
             if old_sa.is_empty() && !new_subaligns.is_empty() {
                 let mut new_sa = new_subaligns.join(";");
                 new_sa.push(';');
@@ -457,7 +478,6 @@ fn handle_sa_tag(
             }
         }
         SaTagMode::Merge => {
-            // Parse old; add new if not present; rewrite.
             let mut old_list: Vec<String> = old_sa
                 .split(';')
                 .filter(|s| !s.is_empty())
@@ -476,6 +496,5 @@ fn handle_sa_tag(
             }
         }
     }
-
     Ok(())
 }

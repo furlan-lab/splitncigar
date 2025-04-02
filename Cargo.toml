@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 clap = "4.0"
 rust-htslib = "0.49"   # or the latest version available
+rayon = "1.5"
+tempfile = "3.3"
