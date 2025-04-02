@@ -3,7 +3,7 @@
 # splitncigar
 
 
-**splitncigar** is a Rust-based tool for processing BAM files that contain spliced reads. It performs the following functions:
+**splitncigar** is a Rust-based tool for processing BAM files that contain spliced reads. It is modelled after the popular [Java implementation](https://gatk.broadinstitute.org/hc/en-us/articles/360036858811-SplitNCigarReads) with some additional tweaks.  It performs the following functions:
 
 - **Splitting Reads**: Splits reads with 'N' operators in the CIGAR string (indicative of spliced reads) into subreads.
 - **Flag Correction**: Optionally corrects the FLAG field in each split subread by copying the original FLAG from the unsplit read.
