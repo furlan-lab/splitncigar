@@ -64,11 +64,12 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         println!("SEQ: {}", seq_str);
 
         // 8) Qualities (ASCII phred)
-        let qual = record.qual();
+        // let qual = record.qual();
         // Build a string of ASCII characters offset by 33
         // or just print them as numeric for clarity
-        let qual_string: Vec<String> = qual.iter().map(|&q| q.to_string()).collect();
-        println!("QUAL (numeric): [{}]", qual_string.join(" "));
+        // let qual_string: Vec<String> = qual.iter().map(|&q| q.to_string()).collect();
+        let qual_string = decode_qual(&record);
+        println!("QUAL (numeric): [{}]", qual_string);
 
         // 9) All auxiliary tags
         //    We'll list each "TAG:VALUE" in alphabetical order by tag
@@ -113,6 +114,11 @@ fn decode_seq(record: &Record) -> String {
             _ => b as char, // If it's ASCII, or an IUPAC code, etc.
         }
     }).collect()
+}
+
+/// Convert a record's nibble-coded or ASCII-coded bases to a string
+fn decode_qual(record: &Record) -> String {
+    record.qual().iter().map(|f| *f as char).collect()
 }
 
 /// Convert an Aux value into a readable String
