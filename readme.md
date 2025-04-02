@@ -2,6 +2,8 @@
 
 # splitncigar
 
+version 0.1.0
+
 
 **splitncigar** is a Rust-based tool for processing BAM files that contain spliced reads. It is modelled after the popular [Java implementation](https://gatk.broadinstitute.org/hc/en-us/articles/360036858811-SplitNCigarReads) with some additional tweaks.  It performs the following functions:
 
@@ -140,7 +142,7 @@ rm HLA-A_reads*
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+This project is licensed under the [MIT License](LICENSE). See the LICENSE file for details.
 
 ## Contributing
 
@@ -149,3 +151,9 @@ Contributions are welcome! Please open an issue or submit a pull request on GitH
 ## Contact
 
 For questions or support, please contact us.
+
+## Version History
+
+<ul>
+  <li>0.1.0 First Version</li>
+</ul>
