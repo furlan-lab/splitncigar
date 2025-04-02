@@ -69,7 +69,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         // or just print them as numeric for clarity
         // let qual_string: Vec<String> = qual.iter().map(|&q| q.to_string()).collect();
         let qual_string = decode_qual(&record);
-        println!("QUAL (numeric): [{}]", qual_string);
+        println!("QUAL: [{}]", qual_string);
 
         // 9) All auxiliary tags
         //    We'll list each "TAG:VALUE" in alphabetical order by tag
