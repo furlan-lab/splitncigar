@@ -132,10 +132,10 @@ samtools index HLA-A_reads.snc.sorted.bam
 # Use slowview to examine the sorted BAM file
 slowview HLA-A_reads.snc.sorted.bam
 
-# Generate BAM summary reports comparing output to data generated using the Java implementation of SplitNCigar followed by an Rscript to fix the flags as mentioned in the publication above
+# Generate BAM summary reports comparing output to data generated using the Java implementation 
+# of SplitNCigar followed by an Rscript to fix the flags as mentioned in the publication above
 bamsummary HLA-A_reads.snc.sorted.bam
 bamsummary data/HLA-A_reads.snc.snc_fc.bam
-
 
 ```
 
