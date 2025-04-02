@@ -1,4 +1,3 @@
-
 /*
 ml Clang/18.1.8-GCCcore-13.3.0
 samtools view data/HLA-A_reads_ds.bam | head -n 1
@@ -16,14 +15,10 @@ samtools view HLA-A_reads.snc.bam | head -n 2
 samtools sort HLA-A_reads.snc.bam -o HLA-A_reads.snc.sorted.bam
 samtools index HLA-A_reads.snc.sorted.bam
 slowview HLA-A_reads.snc.sorted.bam
-
+bamsummary HLA-A_reads.snc.sorted.bam
+bamsummary data/HLA-A_reads.snc.snc_fc.bam
 rm HLA-A_reads*
 */
-
-#![allow(dead_code)]
-
-mod view;  // <-- tells Rust we have a file named src/view.rs
-mod summary;
 
 use clap::{Arg, Command};
 use rust_htslib::bam;
@@ -66,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .arg(
             Arg::new("reference")
-                .short('R')
+                .short('r')
                 .long("reference")
                 .help("Reference FASTA file")
                 .num_args(1)
@@ -90,6 +85,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .help("Print debug info for each read and prompt for user input.")
                 .action(clap::ArgAction::SetTrue),
         )
+        // Option to disable flag correction.
+        .arg(
+            Arg::new("no_flag_correction")
+                .long("no-flag-correction")
+                .help("Disable flag correction (default: enabled)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        // New: Option to choose how to handle SA tags.
+        .arg(
+            Arg::new("sa_mode")
+                .long("sa-mode")
+                .help("Specify how to handle SA tags: overwrite, merge, or preserve (default: merge)")
+                .num_args(1)
+                .default_value("merge"),
+        )
         .get_matches();
 
     let input_path = matches.get_one::<String>("input").unwrap();
@@ -99,12 +109,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     let refactor_cigar_string = matches.get_flag("refactor_cigar_string");
     let skip_mq_transform = matches.get_flag("skip_mq_transform");
     let debug_splits = matches.get_flag("debug_splits");
+    // Determine whether to perform flag correction (enabled by default).
+    let flag_correction = !matches.get_flag("no_flag_correction");
 
-    // For demonstration, pick how we handle existing SA:
-    //   Overwrite, Merge, or Preserve.
-    let sa_mode = SaTagMode::Merge;  // <-- change this as you like
+    // Parse the SA mode from command line.
+    let sa_mode_str = matches.get_one::<String>("sa_mode").unwrap().to_lowercase();
+    let sa_mode = match sa_mode_str.as_str() {
+        "overwrite" => SaTagMode::Overwrite,
+        "merge" => SaTagMode::Merge,
+        "preserve" => SaTagMode::Preserve,
+        other => {
+            eprintln!("Unknown SA mode '{}'; using default 'merge'", other);
+            SaTagMode::Merge
+        }
+    };
 
-    // Open the input BAM
+    // Open the input BAM.
     let mut bam_reader = bam::Reader::from_path(input_path)?;
     let header = bam::Header::from_template(bam_reader.header());
     let headerview = bam::HeaderView::from_header(&header);
@@ -124,7 +144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // e.g. merging adjacent N-D-N segments if needed.
         }
 
-        // Debug: print the original read
+        // Debug: print the original read.
         if debug_splits {
             eprintln!(
                 "[DEBUG] Original read:\n  QNAME={}\n  pos={}\n  seq_len={}\n  CIGAR={}\n  seq={}",
@@ -136,21 +156,32 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
         }
 
-        // Split the read if it has N operators
+        // Save the original flag from the unsplit record.
+        let orig_flag = record.flags();
+
+        // Split the read if it has N operators.
         let mut split_records = split_ncigar_read(&record)?;
 
-        // If multiple subreads, mark them supplementary and set SA:Z
+        // If flag correction is enabled (default), then override the flags
+        // of each split record with the original flag.
+        if flag_correction {
+            for rec in split_records.iter_mut() {
+                rec.set_flags(orig_flag);
+            }
+        }
+
+        // If multiple subreads, mark them supplementary and set SA:Z.
         if split_records.len() > 1 {
             repair_supplementary_tags(&mut split_records);
 
-            // Obtain reference name from tid
+            // Obtain reference name from tid.
             let rname = tid_to_refname(&headerview, record.tid());
 
-            // Build and add sub-alignments in your chosen mode
+            // Build and add sub-alignments using the chosen SA mode.
             annotate_sa_tag(&mut split_records, &rname, sa_mode)?;
         }
 
-        // Debug: print splitted records if more than one
+        // Debug: print splitted records if more than one.
         if debug_splits && split_records.len() > 1 {
             eprintln!("    -> splitted into {} records:", split_records.len());
             for (i, rec) in split_records.iter().enumerate() {
@@ -166,12 +197,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Write out each subrecord
+        // Write out each subrecord.
         for rec in split_records {
             bam_writer.write(&rec)?;
         }
 
-        // If debugging, prompt user for 'q' or Enter
+        // If debugging, prompt user for 'q' or Enter.
         if debug_splits {
             let should_quit = pause_for_debug()?;
             if should_quit {
@@ -342,7 +373,7 @@ fn consumes_query(op: char) -> bool {
     matches!(op, 'M' | 'I' | 'S' | '=' | 'X')
 }
 
-/// remove NM,MD,NH and set 0x800 on non-primary
+/// remove NM, MD, NH and set 0x800 on non-primary
 fn repair_supplementary_tags(records: &mut [bam::Record]) {
     let remove_tags = [b"NM", b"MD", b"NH"];
     for rec in records.iter_mut() {
@@ -353,12 +384,12 @@ fn repair_supplementary_tags(records: &mut [bam::Record]) {
     if records.len() > 1 {
         for rec in records.iter_mut().skip(1) {
             let f = rec.flags();
-            rec.set_flags(f | 0x800); // supplementary
+            rec.set_flags(f | 0x800); // supplementary flag
         }
     }
 }
 
-/// Decide how to handle the existing SA tag
+/// Decide how to handle the existing SA tag.
 fn annotate_sa_tag(
     records: &mut [bam::Record],
     rname: &str,
@@ -368,7 +399,7 @@ fn annotate_sa_tag(
         return Ok(());
     }
 
-    // Build new sub-align lines for each record
+    // Build new sub-align lines for each record.
     let sub_aligns: Vec<String> = records
         .iter()
         .map(|rec| {
@@ -381,7 +412,7 @@ fn annotate_sa_tag(
         })
         .collect();
 
-    // For each record, gather sub-align lines of the *other* splitted records
+    // For each record, gather sub-align lines of the *other* split records.
     for (i, rec) in records.iter_mut().enumerate() {
         let mut new_entries = Vec::new();
         for (j, sa) in sub_aligns.iter().enumerate() {
@@ -395,13 +426,13 @@ fn annotate_sa_tag(
     Ok(())
 }
 
-/// Actually handle Overwrite, Merge, or Preserve existing SA:Z
+/// Actually handle Overwrite, Merge, or Preserve existing SA:Z.
 fn handle_sa_tag(
     rec: &mut bam::Record,
     new_subaligns: &[String],
     mode: SaTagMode,
 ) -> Result<(), Box<dyn Error>> {
-    // fetch existing SA if any
+    // fetch existing SA if any.
     let old_sa = match rec.aux(b"SA") {
         Ok(Aux::String(s)) => s.to_string(),
         _ => String::new(),
@@ -409,7 +440,7 @@ fn handle_sa_tag(
 
     match mode {
         SaTagMode::Overwrite => {
-            // remove old, then write new
+            // Remove old, then write new.
             let _ = rec.remove_aux(b"SA");
             if !new_subaligns.is_empty() {
                 let mut merged = new_subaligns.join(";");
@@ -418,7 +449,7 @@ fn handle_sa_tag(
             }
         }
         SaTagMode::Preserve => {
-            // if old SA is present, do nothing; else add new
+            // If old SA is present, do nothing; else add new.
             if old_sa.is_empty() && !new_subaligns.is_empty() {
                 let mut new_sa = new_subaligns.join(";");
                 new_sa.push(';');
@@ -426,7 +457,7 @@ fn handle_sa_tag(
             }
         }
         SaTagMode::Merge => {
-            // parse old; add new if not present; rewrite
+            // Parse old; add new if not present; rewrite.
             let mut old_list: Vec<String> = old_sa
                 .split(';')
                 .filter(|s| !s.is_empty())

@@ -35,6 +35,14 @@ fn main() {
     println!("Total reads: {}", total_reads);
     println!("Average read length: {:.2}", total_seq_len as f64 / total_reads as f64);
     println!("Average MAPQ: {:.2}", total_mapq as f64 / total_reads as f64);
+
+    // Total number of tag occurrences across all reads.
+    let total_tags: usize = tag_counts.values().sum();
+    println!("Total tags: {}", total_tags);
+
+    // Total number of unique tag types.
+    println!("Total tag types: {}", tag_counts.len());
+
     println!("Tag sizes (approx. byte contribution):");
 
     let mut tags_sorted: Vec<_> = tag_bytes.iter().collect();
