@@ -8,7 +8,7 @@ version 0.1.0
 **splitncigar** is a Rust-based tool for processing BAM files that contain spliced reads. It is modelled after the popular [Java implementation](https://gatk.broadinstitute.org/hc/en-us/articles/360036858811-SplitNCigarReads) with some additional tweaks.  It performs the following functions:
 
 - **Splitting Reads**: Splits reads with 'N' operators in the CIGAR string (indicative of spliced reads) into subreads.
-- **Flag Correction**: Optionally corrects the FLAG field in each split subread by copying the original FLAG from the unsplit read.  This effort was motivated by this [publication] (https://genomebiology.biomedcentral.com/articles/10.1186/s13059-023-02923-y).
+- **Flag Correction**: Optionally corrects the FLAG field in each split subread by copying the original FLAG from the unsplit read.  This effort was motivated by this [publication](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-023-02923-y).
 - **Supplementary Alignment (SA) Tag Handling**: Offers three modes for handling SA tags:
   - **overwrite**: Remove any old SA tag and write only the new subalignments.
   - **merge**: Merge new subalignments with any existing SA tag, avoiding duplicates.
