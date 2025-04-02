@@ -9,6 +9,7 @@ version 0.1.0
 
 - **Splitting Reads**: Splits reads with 'N' operators in the CIGAR string (indicative of spliced reads) into subreads.
 - **Flag Correction**: Optionally corrects the FLAG field in each split subread by copying the original FLAG from the unsplit read.  This effort was motivated by this [publication](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-023-02923-y).
+- **Direct Inspection**: In our experience, long-read RNA sequencing reads processed with the java splitncigar followed by flag correction are not fully IGV compatible in that the read details do not show when "clicking" on a read.  In this rust implementation the output not subject to this problem.
 - **Supplementary Alignment (SA) Tag Handling**: Offers three modes for handling SA tags:
   - **overwrite**: Remove any old SA tag and write only the new subalignments.
   - **merge**: Merge new subalignments with any existing SA tag, avoiding duplicates.
