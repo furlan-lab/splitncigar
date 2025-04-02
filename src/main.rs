@@ -3,7 +3,7 @@
 ml Clang/18.1.8-GCCcore-13.3.0
 samtools view data/HLA-A_reads_ds.bam | head -n 1
 samtools view data/HLA-A_reads.snc.bam | head -n 2
-cargo build --release && cp ~/develop/splitncigar/target/release/splitncigar ~/.local/bin/splitncigar
+cargo build --release && cp ~/develop/splitncigar/target/release/splitncigar ~/.local/bin/splitncigar && cp ~/develop/splitncigar/target/release/slowview ~/.local/bin/slowview && cp ~/develop/splitncigar/target/release/bamsummary ~/.local/bin/bamsummary
 hg38=/Users/sfurlan/refs/GRCh38/GRCh38.p13.genome.fa
 splitncigar --input data/HLA-A_reads_ds.bam \
             --output HLA-A_reads.snc.bam \
@@ -15,11 +15,15 @@ splitncigar --debug-splits \
 samtools view HLA-A_reads.snc.bam | head -n 2
 samtools sort HLA-A_reads.snc.bam -o HLA-A_reads.snc.sorted.bam
 samtools index HLA-A_reads.snc.sorted.bam
-rm HLA-A_reads.snc.bam
+slowview HLA-A_reads.snc.sorted.bam
+
+rm HLA-A_reads*
 */
 
 #![allow(dead_code)]
 
+mod view;  // <-- tells Rust we have a file named src/view.rs
+mod summary;
 
 use clap::{Arg, Command};
 use rust_htslib::bam;
