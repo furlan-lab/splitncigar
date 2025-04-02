@@ -42,7 +42,7 @@ cp target/release/bamsummary ~/.local/bin/bamsummary
 ### Prerequisites
 
 - [Rust](https://www.rust-lang.org/) (latest stable release recommended)
-- [Samtools](http://www.htslib.org/) installed and accessible in your PATH
+- (Optional) [Samtools](http://www.htslib.org/) installed and accessible in your PATH
 - (Optional) A reference FASTA file for the `--reference` option
 
 ### Building
