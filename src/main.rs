@@ -2,7 +2,11 @@
 ml Clang/18.1.8-GCCcore-13.3.0
 samtools view data/HLA-A_reads_ds.bam | head -n 1
 samtools view data/HLA-A_reads.snc.bam | head -n 2
-cargo build --release && cp ~/develop/splitncigar/target/release/splitncigar ~/.local/bin/splitncigar && cp ~/develop/splitncigar/target/release/slowview ~/.local/bin/slowview && cp ~/develop/splitncigar/target/release/bamsummary ~/.local/bin/bamsummary
+cargo build --release \
+    && cp ~/develop/splitncigar/target/release/splitncigar ~/.local/bin/splitncigar \
+    && cp ~/develop/splitncigar/target/release/slowview ~/.local/bin/slowview \
+    && cp ~/develop/splitncigar/target/release/bamsummary ~/.local/bin/bamsummary \
+    && cp ~/develop/splitncigar/target/release/cosmictovcf ~/.local/bin/cosmictovcf
 hg38=/Users/sfurlan/refs/GRCh38/GRCh38.p13.genome.fa
 splitncigar --input data/HLA-A_reads_ds.bam \
             --output HLA-A_reads.snc.bam \
@@ -18,6 +22,11 @@ slowview HLA-A_reads.snc.sorted.bam
 bamsummary HLA-A_reads.snc.sorted.bam
 bamsummary data/HLA-A_reads.snc.snc_fc.bam
 rm HLA-A_reads*
+
+hg38=/Users/sfurlan/refs/GRCh38/GRCh38.p13.genome.fa
+cosmic=/Users/sfurlan/Downloads/Cosmic_MutantCensus_Tsv_v101_GRCh38/Cosmic_MutantCensus_v101_GRCh38.tsv
+cosmictovcf $cosmic cosmic.vcf $hg38
+head $cosmic
 */
 
 use clap::{Arg, Command};

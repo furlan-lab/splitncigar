@@ -2,14 +2,14 @@
 
 # splitncigar
 
-version 0.1.0
+version 0.2.0
 
 
 **splitncigar** is a Rust-based tool for processing BAM files that contain spliced reads. It is modelled after the popular [Java implementation](https://gatk.broadinstitute.org/hc/en-us/articles/360036858811-SplitNCigarReads) with some additional tweaks.  It performs the following functions:
 
 - **Splitting Reads**: Splits reads with 'N' operators in the CIGAR string (indicative of spliced reads) into subreads.
-- **Flag Correction**: Optionally corrects the FLAG field in each split subread by copying the original FLAG from the unsplit read.  This effort was motivated by this [publication](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-023-02923-y).
-- **Direct Inspection**: In our experience, long-read RNA sequencing reads processed with the java splitncigar followed by flag correction are not fully IGV compatible in that the read details do not show when "clicking" on a read.  In this rust implementation the output not subject to this problem.
+- **Flag Correction**: Optionally corrects the FLAG field in each split subread by copying the original FLAG from the unsplit read. This effort was motivated by this [publication](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-023-02923-y).
+- **Direct Inspection**: In our experience, long-read RNA sequencing reads processed with the Java SplitNCigar followed by flag correction are not fully IGV-compatible, as the read details do not show when "clicking" on a read. In this Rust implementation, the output is not subject to this problem.
 - **Supplementary Alignment (SA) Tag Handling**: Offers three modes for handling SA tags:
   - **overwrite**: Remove any old SA tag and write only the new subalignments.
   - **merge**: Merge new subalignments with any existing SA tag, avoiding duplicates.
@@ -24,7 +24,7 @@ version 0.1.0
 - **FLAG Correction**: By default, copies the FLAG from the original unsplit read to all split records. This can be disabled via a command-line flag.
 - **Customizable SA Handling**: Choose from three different SA tag modes (overwrite, merge, or preserve) via the `--sa-mode` option.
 - **Debug Mode**: Run with `--debug-splits` to print detailed processing information and step through splits interactively.
-- **Utility Binaries**: In addition to the main `splitncigar` binary, use `slowview` for viewing BAM files and `bamsummary` for summarizing BAM statistics.
+- **Utility Binaries**: In addition to the main `splitncigar` binary, use `slowview` for viewing BAM files and `bamsummary` for summarizing BAM statistics.  `cosmictovcf` takes a COSMIC tsv file and creates a vcf for easier annotation using VEP of SNPEff
 
 ## Installation
 
@@ -156,4 +156,5 @@ For questions or support, please contact us.
 
 <ul>
   <li>0.1.0 First Version</li>
+  <li>0.2.0 Added cosmictovcf</li>
 </ul>
