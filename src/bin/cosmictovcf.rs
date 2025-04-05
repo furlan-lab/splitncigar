@@ -3,63 +3,41 @@ Below is a high-level overview of how the code processes the COSMIC TSV and crea
 
 1. **Reading Inputs and Setting Up:**  
    - **Command-Line Arguments:**  
-     The program expects three arguments: the input COSMIC TSV file, the output VCF filename (which will be gzipped), and the reference FASTA file (with its index present).  
+     The program expects at least three arguments: the input COSMIC TSV file, the output VCF filename, and the reference FASTA file (with its index present). An optional fourth argument ("true" or "false") specifies whether to compress the output.
      
    - **Loading the Reference FASTA:**  
-     The code opens the FASTA using a FASTA reader from rust-htslib. It also reads the corresponding FASTA index (.fai) to build a set of available contig names. This set is later used to map the chromosome information from the TSV to the proper FASTA contig (for example, by adding the "chr" prefix if needed).
+     The code opens the FASTA (using rust-htslib) and reads the corresponding FASTA index (.fai) to build a set of available contig names. This set is later used to map the TSV chromosome to the correct FASTA contig (adding a "chr" prefix if needed).
 
    - **Building the VCF Header:**  
-     Using the contig names (from the FASTA index) and other metadata (such as reference, filter, and INFO fields), the program builds a VCF header. All contig names in the header are formatted to start with "chr".
+     Using the contig names and other metadata, the program builds a VCF header (all contig names are ensured to start with "chr").
 
 2. **Processing Each TSV Record:**  
-   The TSV file is read record-by-record using a CSV reader configured for tab-delimited input. For each record:
+   The TSV file is read record-by-record. For each record:
    
    - **Filtering Incomplete Records:**  
-     The program first checks if essential genomic information is missing (e.g., if the chromosome field is empty, starts with a "#", or if the genome start position is missing). Such records are counted as skipped.
+     Records missing essential genomic information (e.g. chromosome or start position) are skipped.
      
    - **Mapping Chromosome to FASTA Contig:**  
-     The code takes the chromosome value from the record and verifies whether it exists in the FASTA contigs set. If the raw value isn’t found, it attempts to add a "chr" prefix. If a matching contig is found, that name is used for FASTA lookups and then re-formatted (if needed) for the VCF header.
-
-3. **Handling Alleles (REF and ALT):**  
-   The code carefully handles cases where allele information may be incomplete:
-   
-   - **Missing REF Allele:**  
-     If the REF allele from the TSV is empty, it is substituted with a dot `"."`. This indicates a missing allele in the input and triggers special handling in the normalization step.  
+     The TSV’s chromosome value is mapped to the appropriate FASTA contig name.
      
-   - **Missing ALT Allele (Deletions):**  
-     If the ALT allele is empty, the program interprets the event as a deletion. In VCF, deletions are represented by including the left‐flanking base:
-     - The code fetches the left base from the reference (using the FASTA) at the position immediately preceding the mutation.
-     - It then adjusts the position (shifting it one base to the left) and constructs a new REF allele by concatenating the left base with the original REF allele.
-     - The new ALT allele becomes just the left base.  
+   - **Full Reference Check:**  
+     If the TSV provides a nonempty REF allele (i.e. not missing or “.”), the code fetches the full reference sequence from the FASTA using the TSV’s GENOME_START and GENOME_STOP positions. It then confirms that this fetched sequence matches the TSV’s REF allele (after converting both to uppercase). If they do not match, the record is skipped and counted as a reference mismatch.
      
-   These steps ensure that even if the TSV does not supply complete allele information, the code can “rescue” the record by reconstructing a valid VCF representation.
-
-4. **Normalization of Variants:**  
-   After handling missing alleles:
-   - The code calls a normalization function that may further adjust the variant’s position and allele representation (left-normalization).  
-   - This normalization repeatedly checks if the last base of both alleles matches the base immediately preceding the variant in the reference. If so, the variant is shifted one base to the left. This standardizes the representation for indels.
-
-5. **Creating and Writing the VCF Record:**  
-   With the normalized information:
-   - A VCF record is created where the contig is set (using the “chr”-prefixed name), the position is converted to 0-based indexing, and the alleles (REF and ALT) are assigned.
-   - The record is annotated with additional INFO fields (such as gene symbol, transcript accession, etc.) taken from the TSV.
-   - The record is then written to the VCF output, which is produced in BGZF (gzipped) format.
-
-6. **Record Counters and Final Summary:**  
-   Throughout processing, the code maintains counters for:
-   - Total records read.
-   - Records successfully processed (written to the VCF).
-   - Records skipped (due to missing/incomplete genomic information or normalization issues).  
+   - **Handling Alleles:**  
+     *Missing REF Allele:* If the TSV REF is empty, it’s replaced with “.” (triggering later left‑flanking base addition).  
+     *Missing ALT Allele (Deletions):* If the ALT allele is empty, the record is assumed to represent a deletion; the left‑flanking base is fetched, the coordinate is adjusted (shifted one base to the left), and the REF and ALT are updated accordingly.
      
-   At the end, a summary message is printed displaying these counts.
+   - **Normalization:**  
+     The variant is left‑normalized (shifting left while the last bases of REF and ALT match the preceding reference base).
+     
+   - **Writing the VCF Record:**  
+     A VCF record is created (with 0‑based positions) and annotated with INFO fields from the TSV. It’s then written to the output VCF (which is compressed or not according to the optional flag).
 
----
+3. **Summary:**  
+   At the end, the code prints a summary with counts for total records read, processed, skipped, reference mismatches, and any records that were “corrected” (if applicable).
 
 **In summary:**  
-The code reads each COSMIC TSV record, checks and maps genomic information to the reference FASTA, and then handles incomplete allele data:
-- Missing REF alleles are replaced with `"."` to trigger left-base fetching.
-- Missing ALT alleles (interpreted as deletions) are rescued by prepending the left-flanking base from the reference, adjusting the variant accordingly.
-After normalizing indels by shifting them left as necessary, the code writes a complete VCF record for each valid entry, all while tracking and reporting on the number of records processed versus skipped.
+The code confirms that each TSV record’s provided reference allele (over the region defined by GENOME_START–GENOME_STOP) matches the FASTA’s sequence before proceeding. Missing REF alleles trigger left‑flanking base addition for insertions, and missing ALT alleles (deletions) are rescued similarly. After normalization, a valid VCF record is written for each record that passes the checks.
 
 */
 
@@ -106,9 +84,9 @@ struct CosmicRecord {
     MUTATION_SOMATIC_STATUS: String,
 }
 
-/// Naively left‐normalize an indel variant.
-/// Shifts the variant to the left as long as the last base of the reference
-/// allele and alternate allele is identical to the base immediately preceding the variant.
+/// Naively left‑normalize an indel variant.
+/// Shifts the variant to the left as long as the last base of the REF and ALT alleles is identical to
+/// the base immediately preceding the variant.
 fn left_normalize_variant(
     chrom: &str,
     mut pos: usize,
@@ -129,7 +107,7 @@ fn left_normalize_variant(
         if last_ref != last_alt {
             break;
         }
-        // FASTA coordinates are 0-based; fetch region (pos-2, pos-1)
+        // FASTA coordinates are 0‑based; fetch region (pos‑2, pos‑1)
         let prev_base = fasta.fetch_seq(chrom, pos - 2, pos - 1)?.to_ascii_uppercase();
         if prev_base.len() != 1 {
             break;
@@ -149,8 +127,8 @@ fn left_normalize_variant(
 
 /// Normalize a variant:
 /// - If the REF allele is missing (i.e. "." or empty) or if the alleles differ in length (an indel),
-///   fetch the left flanking base from the reference and prepend it to both alleles.
-/// - Then apply left normalization.
+///   fetch the left‑flanking base from the reference and prepend it to both alleles.
+/// - Then apply left‑normalization.
 fn normalize_variant(
     chrom: &str,
     pos: usize,
@@ -183,18 +161,31 @@ fn normalize_variant(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Expect three command-line arguments:
+    // Expect three or four command-line arguments:
     // 1. Input COSMIC TSV file
-    // 2. Output VCF file (gzipped)
+    // 2. Output VCF file
     // 3. Reference FASTA (indexed)
+    // 4. (Optional) Compression option ("true" for compressed, "false" for uncompressed)
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("Usage: {} <input_cosmic_tsv> <output_vcf.gz> <reference_fasta>", args[0]);
+        eprintln!(
+            "Usage: {} <input_cosmic_tsv> <output_vcf> <reference_fasta> [compress]",
+            args[0]
+        );
         std::process::exit(1);
     }
     let input_tsv = &args[1];
     let output_vcf = &args[2];
     let ref_fasta_path = &args[3];
+
+    // Parse compression option. Default: true (compress)
+    // NOTE: Due to rust-htslib behavior, passing true means we want compression,
+    // so we invert the flag when calling Writer::from_path.
+    let compress_flag: bool = if args.len() > 4 {
+        args[4].parse().unwrap_or(true)
+    } else {
+        true
+    };
 
     // Open the FASTA.
     let fasta = faidx::Reader::from_path(ref_fasta_path)?;
@@ -228,7 +219,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             fasta_contigs.insert(contig.to_string());
             if let Some(length_str) = parts.next() {
                 let contig_length: u64 = length_str.parse()?;
-                // For the VCF header, ensure contig names start with "chr".
+                // Ensure contig names in header start with "chr".
                 let vcf_contig = if contig.starts_with("chr") {
                     contig.to_string()
                 } else {
@@ -240,8 +231,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     header.push_record(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO");
 
-    // Create a VCF writer with BGZF (gzipped) output.
-    let mut writer = Writer::from_path(output_vcf, &header, true, bcf::Format::Vcf)?;
+    // Create a VCF writer.
+    // Due to rust-htslib behavior, we pass !compress_flag to force_bgzf.
+    let mut writer = Writer::from_path(output_vcf, &header, !compress_flag, bcf::Format::Vcf)?;
 
     let mut rdr = ReaderBuilder::new().delimiter(b'\t').from_path(input_tsv)?;
 
@@ -249,6 +241,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut total_records = 0;
     let mut processed_records = 0;
     let mut skipped_records = 0;
+    let mut ref_mismatch_errors = 0;
+    let corrected_records = 0;
 
     for result in rdr.deserialize() {
         total_records += 1;
@@ -261,16 +255,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        // Check if genomic information is incomplete.
-        if record.CHROMOSOME.trim().is_empty() ||
-           record.CHROMOSOME.starts_with('#') ||
-           record.GENOME_START.trim().is_empty() {
+        // Check for missing essential genomic info.
+        if record.CHROMOSOME.trim().is_empty()
+            || record.CHROMOSOME.starts_with('#')
+            || record.GENOME_START.trim().is_empty()
+        {
             skipped_records += 1;
             continue;
         }
 
         let original_chrom = record.CHROMOSOME.trim();
-        // Determine the correct FASTA contig name.
+        // Map the TSV chromosome to a FASTA contig.
         let fasta_contig = if fasta_contigs.contains(original_chrom) {
             original_chrom.to_string()
         } else if fasta_contigs.contains(&format!("chr{}", original_chrom)) {
@@ -280,7 +275,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             skipped_records += 1;
             continue;
         };
-        // For VCF output, ensure the contig name starts with "chr".
+        // For VCF output, ensure contig name starts with "chr".
         let vcf_chrom = if fasta_contig.starts_with("chr") {
             fasta_contig.clone()
         } else {
@@ -288,7 +283,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
 
         // Parse genomic start position.
-        let mut pos: usize = match record.GENOME_START.parse() {
+        let mut pos: usize = match record.GENOME_START.trim().parse() {
             Ok(p) => p,
             Err(_) => {
                 eprintln!("Skipping record with invalid start position: {}", record.GENOME_START);
@@ -302,12 +297,39 @@ fn main() -> Result<(), Box<dyn Error>> {
         let raw_ref_orig = record.GENOMIC_WT_ALLELE.trim();
         let raw_alt_orig = record.GENOMIC_MUT_ALLELE.trim();
 
-        // If REF allele is empty, treat it as insertion (set to ".")
-        let mut raw_ref = if raw_ref_orig.is_empty() { ".".to_string() } else { raw_ref_orig.to_string() };
+        // Full reference check: if TSV provides a nonempty REF allele (not "."), confirm that the
+        // reference sequence from the FASTA for the region [GENOME_START, GENOME_STOP] matches it.
+        if !raw_ref_orig.is_empty() && raw_ref_orig != "." {
+            let stop: usize = match record.GENOME_STOP.trim().parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("Skipping record with invalid stop position: {}", record.GENOME_STOP);
+                    skipped_records += 1;
+                    continue;
+                }
+            };
+            let expected_full = fasta.fetch_seq(&fasta_contig, pos - 1, stop - 1)?;
+            let expected_full_str = String::from_utf8(expected_full)?.to_uppercase();
+            if expected_full_str != raw_ref_orig.to_uppercase() {
+                eprintln!(
+                    "Full reference mismatch for record {}: TSV REF '{}' does not match reference '{}'",
+                    var_id, raw_ref_orig, expected_full_str
+                );
+                ref_mismatch_errors += 1;
+                continue;
+            }
+        }
+
+        // If REF allele is empty, treat as insertion by setting it to "."
+        let mut raw_ref = if raw_ref_orig.is_empty() {
+            ".".to_string()
+        } else {
+            raw_ref_orig.to_string()
+        };
         let mut raw_alt = raw_alt_orig.to_string();
 
-        // If ALT allele is empty, interpret this as a deletion.
-        // In VCF a deletion is represented by prepending the left flanking base.
+        // If ALT allele is empty, treat as deletion.
+        // For a deletion, fetch the left‑flanking base and adjust coordinates and alleles.
         if raw_alt.is_empty() {
             if pos > 1 {
                 let left_base = fasta.fetch_seq(&fasta_contig, pos - 2, pos - 1)?.to_ascii_uppercase();
@@ -325,6 +347,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // Normalize the variant (left‑normalization).
         let (norm_pos, norm_ref, norm_alt) =
             match normalize_variant(&fasta_contig, pos, &raw_ref, &raw_alt, &fasta) {
                 Ok(v) => v,
@@ -338,7 +361,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut vcf_record = writer.empty_record();
         let rid = writer.header().name2rid(vcf_chrom.as_bytes())?;
         vcf_record.set_rid(Some(rid));
-        // VCF positions are 0-based.
+        // VCF positions are 0‑based.
         vcf_record.set_pos((norm_pos - 1) as i64);
         let _ = vcf_record.set_id(var_id.as_bytes());
         if let Err(e) = vcf_record.set_alleles(&[norm_ref.as_bytes(), norm_alt.as_bytes()]) {
@@ -365,8 +388,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "Summary: Total records read: {}. Processed: {}. Skipped: {}.",
-        total_records, processed_records, skipped_records
+        "Summary: Total records read: {}. Processed: {}. Skipped: {}. Reference mismatches: {}. Corrected records: {}.",
+        total_records, processed_records, skipped_records, ref_mismatch_errors, corrected_records
     );
 
     Ok(())
