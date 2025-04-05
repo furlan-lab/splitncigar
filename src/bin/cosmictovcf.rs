@@ -1,3 +1,73 @@
+/*
+
+
+### High-Level Summary: COSMIC TSV to VCF Converter
+
+1. **Input and Initialization:**
+   - **Command-Line Arguments:**  
+     The program requires three mandatory arguments:
+     - The COSMIC TSV file (which may be plain text or gzipped),
+     - The output VCF file name,
+     - The reference FASTA file (with its accompanying index file, .fai).  
+     An optional fourth argument specifies whether the output VCF should be compressed (gzipped).
+     
+   - **Reference FASTA Loading:**  
+     The code opens the reference FASTA file using rust-htslib’s FASTA reader. It also reads the FASTA index to build a set of available contig names. This ensures that chromosome names from the TSV can be mapped to the correct contigs (adding a "chr" prefix when necessary).
+
+   - **VCF Header Construction:**  
+     A VCF header is built that includes metadata such as file format, reference, filter definitions, and INFO field definitions. It also includes a contig line for each contig (all formatted with a "chr" prefix) from the FASTA index.
+
+2. **Reading the Input TSV:**
+   - The input COSMIC TSV file is opened. If its filename ends with “.gz,” it is wrapped in a GzDecoder so that gzipped files are handled seamlessly.
+   - A CSV reader (configured for tab-delimited input) reads the file record-by-record.
+
+3. **Record Processing:**
+   - **Basic Filtering:**  
+     The code skips any record that is missing essential genomic information (e.g., an empty chromosome or missing GENOME_START).
+   
+   - **Chromosome Mapping:**  
+     The chromosome field from the TSV is mapped to the corresponding FASTA contig. If needed, the code adds the “chr” prefix to match the FASTA naming convention.
+
+   - **Parsing Coordinates:**  
+     The GENOME_START and GENOME_STOP values are parsed as coordinates. These define the region over which the reference allele (if provided) is expected.
+
+4. **Full Reference Verification and Correction:**
+   - **Reference Check:**  
+     If the TSV provides a nonempty reference allele (other than “.”), the code fetches the full reference sequence from the FASTA for the region defined by GENOME_START and GENOME_STOP.  
+     - For one-base substitutions, if GENOME_STOP equals GENOME_START+1, the code subtracts 1 from the stop coordinate so that exactly one base is fetched.
+   - **Mismatch Handling and Correction:**  
+     If the fetched reference sequence (converted to uppercase) does not match the TSV’s REF allele, the record is either:
+     - **Attempted to be corrected:** If the TSV REF is one base long and the fetched sequence is two bases, the code assumes that the TSV is missing its left-flanking base. It then adjusts the coordinate, updates the REF (and ALT if provided), and increments a counter for corrected records.
+     - **Otherwise skipped:** If no correction is possible, the record is skipped and logged as a reference mismatch error.
+
+5. **Allele Handling and Normalization:**
+   - **Handling Missing Alleles:**
+     - If the TSV’s REF allele is missing, it is set to “.” (indicating an insertion, which will trigger left-flanking base addition later).
+     - If the TSV’s ALT allele is missing (suggesting a deletion), the code fetches the left-flanking base from the reference. It then adjusts the coordinate (shifting one base to the left) and constructs new REF and ALT alleles that include this base.
+   - **Left-Normalization:**  
+     The variant is then left-normalized. This process shifts the variant leftward while the last base of both alleles matches the base immediately preceding the variant in the reference. This ensures a canonical representation for indels.
+
+6. **VCF Record Construction and Output:**
+   - A VCF record is created with:
+     - **Contig and Position:** Set using the mapped contig name (with "chr") and a 0-based position.
+     - **ID, Alleles, Quality, and Filters:** The record is assigned an ID, alleles are set (after normalization), quality is set to -1, and a "PASS" filter is applied.
+     - **INFO Fields:** Additional metadata fields (e.g., GeneSymbol, Transcript, SampleName, etc.) are added to the record.  
+       **Note:** Before adding the SAMPLE_NAME value, any semicolons are removed to prevent issues with downstream VCF tools.
+   - The record is then written to the output VCF file. The output file will be gzipped if the compression flag is set.
+
+7. **Summary and Reporting:**
+   - Throughout processing, counters are maintained for:
+     - **Total Records Read**
+     - **Records Successfully Processed (written to VCF)**
+     - **Records Skipped** (due to missing information or errors)
+     - **Reference Mismatch Errors**
+     - **Corrected Records** (where a mismatch was automatically fixed)
+   - At the end, a summary message is printed displaying these counts.
+
+---
+
+*/
+
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 use std::collections::HashSet;
@@ -339,7 +409,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         vcf_record.set_filters(&[&b"PASS"[..]])?;
         vcf_record.push_info_string(b"GeneSymbol", &[record.GENE_SYMBOL.as_bytes()])?;
         vcf_record.push_info_string(b"Transcript", &[record.TRANSCRIPT_ACCESSION.as_bytes()])?;
-        vcf_record.push_info_string(b"SampleName", &[record.SAMPLE_NAME.as_bytes()])?;
+        let sample_name = record.SAMPLE_NAME.replace(";", "");
+        vcf_record.push_info_string(b"SampleName", &[sample_name.as_bytes()])?;
         vcf_record.push_info_string(b"PubMed", &[record.PUBMED_PMID.as_bytes()])?;
         vcf_record.push_info_string(b"StudyID", &[record.COSMIC_STUDY_ID.as_bytes()])?;
         vcf_record.push_info_string(b"CDS", &[record.MUTATION_CDS.as_bytes()])?;
