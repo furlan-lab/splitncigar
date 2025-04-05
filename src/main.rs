@@ -26,7 +26,6 @@ rm HLA-A_reads*
 hg38=/Users/sfurlan/refs/GRCh38/GRCh38.p13.genome.fa
 cosmic=/Users/sfurlan/Downloads/Cosmic_MutantCensus_Tsv_v101_GRCh38/Cosmic_MutantCensus_v101_GRCh38.tsv.gz
 cosmictovcf $cosmic cosmic.vcf.gz $hg38
-head $cosmic
 */
 
 use clap::{Arg, Command};
