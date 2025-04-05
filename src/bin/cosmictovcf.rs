@@ -1,59 +1,16 @@
-/*
-Below is a high-level overview of how the code processes the COSMIC TSV and creates the VCF, with special attention to how missing sequences (REF and ALT alleles) are handled:
-
-1. **Reading Inputs and Setting Up:**  
-   - **Command-Line Arguments:**  
-     The program expects at least three arguments: the input COSMIC TSV file, the output VCF filename, and the reference FASTA file (with its index present). An optional fourth argument ("true" or "false") specifies whether to compress the output.
-     
-   - **Loading the Reference FASTA:**  
-     The code opens the FASTA (using rust-htslib) and reads the corresponding FASTA index (.fai) to build a set of available contig names. This set is later used to map the TSV chromosome to the correct FASTA contig (adding a "chr" prefix if needed).
-
-   - **Building the VCF Header:**  
-     Using the contig names and other metadata, the program builds a VCF header (all contig names are ensured to start with "chr").
-
-2. **Processing Each TSV Record:**  
-   The TSV file is read record-by-record. For each record:
-   
-   - **Filtering Incomplete Records:**  
-     Records missing essential genomic information (e.g. chromosome or start position) are skipped.
-     
-   - **Mapping Chromosome to FASTA Contig:**  
-     The TSV’s chromosome value is mapped to the appropriate FASTA contig name.
-     
-   - **Full Reference Check:**  
-     If the TSV provides a nonempty REF allele (i.e. not missing or “.”), the code fetches the full reference sequence from the FASTA using the TSV’s GENOME_START and GENOME_STOP positions. It then confirms that this fetched sequence matches the TSV’s REF allele (after converting both to uppercase). If they do not match, the record is skipped and counted as a reference mismatch.
-     
-   - **Handling Alleles:**  
-     *Missing REF Allele:* If the TSV REF is empty, it’s replaced with “.” (triggering later left‑flanking base addition).  
-     *Missing ALT Allele (Deletions):* If the ALT allele is empty, the record is assumed to represent a deletion; the left‑flanking base is fetched, the coordinate is adjusted (shifted one base to the left), and the REF and ALT are updated accordingly.
-     
-   - **Normalization:**  
-     The variant is left‑normalized (shifting left while the last bases of REF and ALT match the preceding reference base).
-     
-   - **Writing the VCF Record:**  
-     A VCF record is created (with 0‑based positions) and annotated with INFO fields from the TSV. It’s then written to the output VCF (which is compressed or not according to the optional flag).
-
-3. **Summary:**  
-   At the end, the code prints a summary with counts for total records read, processed, skipped, reference mismatches, and any records that were “corrected” (if applicable).
-
-**In summary:**  
-The code confirms that each TSV record’s provided reference allele (over the region defined by GENOME_START–GENOME_STOP) matches the FASTA’s sequence before proceeding. Missing REF alleles trigger left‑flanking base addition for insertions, and missing ALT alleles (deletions) are rescued similarly. After normalization, a valid VCF record is written for each record that passes the checks.
-
-*/
-
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 
 use csv::ReaderBuilder;
 use rust_htslib::{bcf, bcf::header::Header, bcf::Writer, faidx};
 use serde::Deserialize;
+use flate2::read::GzDecoder;
 
 /// A record representing one line of the COSMIC TSV.
-/// Field names must match the TSV header exactly.
 #[derive(Debug, Deserialize)]
 struct CosmicRecord {
     GENE_SYMBOL: String,
@@ -84,9 +41,7 @@ struct CosmicRecord {
     MUTATION_SOMATIC_STATUS: String,
 }
 
-/// Naively left‑normalize an indel variant.
-/// Shifts the variant to the left as long as the last base of the REF and ALT alleles is identical to
-/// the base immediately preceding the variant.
+/// Left-normalize an indel variant.
 fn left_normalize_variant(
     chrom: &str,
     mut pos: usize,
@@ -98,7 +53,6 @@ fn left_normalize_variant(
         return Err("Reference or alternate allele is empty during normalization".into());
     }
     loop {
-        // Cannot shift if at the beginning.
         if pos <= 1 {
             break;
         }
@@ -107,7 +61,6 @@ fn left_normalize_variant(
         if last_ref != last_alt {
             break;
         }
-        // FASTA coordinates are 0‑based; fetch region (pos‑2, pos‑1)
         let prev_base = fasta.fetch_seq(chrom, pos - 2, pos - 1)?.to_ascii_uppercase();
         if prev_base.len() != 1 {
             break;
@@ -117,7 +70,6 @@ fn left_normalize_variant(
         if last_ref != prev_char {
             break;
         }
-        // Shift left: drop the last base from both alleles and prepend the left base.
         pos -= 1;
         ref_allele = format!("{}{}", prev_char, &ref_allele[..ref_allele.len() - 1]);
         alt_allele = format!("{}{}", prev_char, &alt_allele[..alt_allele.len() - 1]);
@@ -125,10 +77,7 @@ fn left_normalize_variant(
     Ok((pos, ref_allele, alt_allele))
 }
 
-/// Normalize a variant:
-/// - If the REF allele is missing (i.e. "." or empty) or if the alleles differ in length (an indel),
-///   fetch the left‑flanking base from the reference and prepend it to both alleles.
-/// - Then apply left‑normalization.
+/// Normalize a variant (prepend left base if needed and then left-normalize).
 fn normalize_variant(
     chrom: &str,
     pos: usize,
@@ -161,11 +110,7 @@ fn normalize_variant(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Expect three or four command-line arguments:
-    // 1. Input COSMIC TSV file
-    // 2. Output VCF file
-    // 3. Reference FASTA (indexed)
-    // 4. (Optional) Compression option ("true" for compressed, "false" for uncompressed)
+    // Expect 3 or 4 arguments: input TSV, output VCF, reference FASTA, [compress]
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
         eprintln!(
@@ -178,9 +123,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output_vcf = &args[2];
     let ref_fasta_path = &args[3];
 
-    // Parse compression option. Default: true (compress)
-    // NOTE: Due to rust-htslib behavior, passing true means we want compression,
-    // so we invert the flag when calling Writer::from_path.
+    // Parse compression option (default true).
     let compress_flag: bool = if args.len() > 4 {
         args[4].parse().unwrap_or(true)
     } else {
@@ -190,9 +133,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Open the FASTA.
     let fasta = faidx::Reader::from_path(ref_fasta_path)?;
 
-    // Build a set of contig names from the FASTA index (.fai)
+    // Build contig set and VCF header.
     let mut fasta_contigs = HashSet::new();
-    // Build the VCF header.
     let mut header = Header::new();
     header.push_record(b"##fileformat=VCFv4.2");
     header.push_record(format!("##reference={}", ref_fasta_path).as_bytes());
@@ -219,7 +161,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             fasta_contigs.insert(contig.to_string());
             if let Some(length_str) = parts.next() {
                 let contig_length: u64 = length_str.parse()?;
-                // Ensure contig names in header start with "chr".
                 let vcf_contig = if contig.starts_with("chr") {
                     contig.to_string()
                 } else {
@@ -231,18 +172,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     header.push_record(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO");
 
-    // Create a VCF writer.
-    // Due to rust-htslib behavior, we pass !compress_flag to force_bgzf.
+    // Create VCF writer (invert compress_flag per rust-htslib behavior).
     let mut writer = Writer::from_path(output_vcf, &header, !compress_flag, bcf::Format::Vcf)?;
 
-    let mut rdr = ReaderBuilder::new().delimiter(b'\t').from_path(input_tsv)?;
+    // Open the TSV file (handle gzipped input if needed).
+    let file = std::fs::File::open(input_tsv)?;
+    let reader: Box<dyn Read> = if input_tsv.ends_with(".gz") {
+        Box::new(GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    let mut rdr = ReaderBuilder::new().delimiter(b'\t').from_reader(reader);
 
     // Counters for summary.
     let mut total_records = 0;
     let mut processed_records = 0;
     let mut skipped_records = 0;
     let mut ref_mismatch_errors = 0;
-    let corrected_records = 0;
+    let mut corrected_records = 0;
 
     for result in rdr.deserialize() {
         total_records += 1;
@@ -255,7 +202,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        // Check for missing essential genomic info.
         if record.CHROMOSOME.trim().is_empty()
             || record.CHROMOSOME.starts_with('#')
             || record.GENOME_START.trim().is_empty()
@@ -265,7 +211,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         let original_chrom = record.CHROMOSOME.trim();
-        // Map the TSV chromosome to a FASTA contig.
         let fasta_contig = if fasta_contigs.contains(original_chrom) {
             original_chrom.to_string()
         } else if fasta_contigs.contains(&format!("chr{}", original_chrom)) {
@@ -275,14 +220,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             skipped_records += 1;
             continue;
         };
-        // For VCF output, ensure contig name starts with "chr".
         let vcf_chrom = if fasta_contig.starts_with("chr") {
             fasta_contig.clone()
         } else {
             format!("chr{}", fasta_contig)
         };
 
-        // Parse genomic start position.
+        // Parse GENOME_START and GENOME_STOP.
         let mut pos: usize = match record.GENOME_START.trim().parse() {
             Ok(p) => p,
             Err(_) => {
@@ -291,36 +235,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
         };
+        let stop: usize = match record.GENOME_STOP.trim().parse() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping record with invalid stop position: {}", record.GENOME_STOP);
+                skipped_records += 1;
+                continue;
+            }
+        };
 
         let var_id = record.GENOMIC_MUTATION_ID.as_str();
-
         let raw_ref_orig = record.GENOMIC_WT_ALLELE.trim();
         let raw_alt_orig = record.GENOMIC_MUT_ALLELE.trim();
 
-        // Full reference check: if TSV provides a nonempty REF allele (not "."), confirm that the
-        // reference sequence from the FASTA for the region [GENOME_START, GENOME_STOP] matches it.
-        if !raw_ref_orig.is_empty() && raw_ref_orig != "." {
-            let stop: usize = match record.GENOME_STOP.trim().parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    eprintln!("Skipping record with invalid stop position: {}", record.GENOME_STOP);
-                    skipped_records += 1;
-                    continue;
-                }
-            };
-            let expected_full = fasta.fetch_seq(&fasta_contig, pos - 1, stop - 1)?;
-            let expected_full_str = String::from_utf8(expected_full)?.to_uppercase();
-            if expected_full_str != raw_ref_orig.to_uppercase() {
-                eprintln!(
-                    "Full reference mismatch for record {}: TSV REF '{}' does not match reference '{}'",
-                    var_id, raw_ref_orig, expected_full_str
-                );
-                ref_mismatch_errors += 1;
-                continue;
-            }
-        }
-
-        // If REF allele is empty, treat as insertion by setting it to "."
+        // Declare mutable raw_ref and raw_alt so that we can update them if needed.
         let mut raw_ref = if raw_ref_orig.is_empty() {
             ".".to_string()
         } else {
@@ -328,8 +256,48 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         let mut raw_alt = raw_alt_orig.to_string();
 
-        // If ALT allele is empty, treat as deletion.
-        // For a deletion, fetch the left‑flanking base and adjust coordinates and alleles.
+        // Full reference check:
+        // If TSV provides a nonempty REF (not "."), fetch the reference sequence for [GENOME_START, GENOME_STOP].
+        // For one-base substitutions, if REF length is 1 and stop == pos+1, subtract 1 from stop.
+        if !raw_ref_orig.is_empty() && raw_ref_orig != "." {
+            // if raw_ref_orig.len() == 1 && stop == pos + 1 {
+            //     stop -= 1;
+            // }
+            let expected_full = fasta.fetch_seq(&fasta_contig, pos - 1, stop -1 )?;
+            let expected_full_str = String::from_utf8(expected_full)?.to_uppercase();
+            if expected_full_str != raw_ref_orig.to_uppercase() {
+                // Attempt correction for one-base REF.
+                if raw_ref_orig.len() == 1 && expected_full_str.len() == 2 && pos > 1 {
+                    let expected_extra = fasta.fetch_seq(&fasta_contig, pos - 2, pos - 2 + raw_ref_orig.len() + 1)?;
+                    let expected_extra_str = String::from_utf8(expected_extra)?.to_uppercase();
+                    if expected_extra_str.ends_with(&raw_ref_orig.to_uppercase()) {
+                        let extra = expected_extra_str.len() - raw_ref_orig.len();
+                        pos = pos.saturating_sub(extra);
+                        raw_ref = expected_extra_str.clone();
+                        if !raw_alt_orig.is_empty() {
+                            raw_alt = format!("{}{}", expected_extra_str.chars().next().unwrap(), raw_alt_orig);
+                        }
+                        corrected_records += 1;
+                    } else {
+                        eprintln!(
+                            "Full reference mismatch for record {}: TSV REF '{}' does not match reference '{}'",
+                            var_id, raw_ref_orig, expected_full_str
+                        );
+                        ref_mismatch_errors += 1;
+                        continue;
+                    }
+                } else {
+                    eprintln!(
+                        "Full reference mismatch for record {}: TSV REF '{}' does not match reference '{}'",
+                        var_id, raw_ref_orig, expected_full_str
+                    );
+                    ref_mismatch_errors += 1;
+                    continue;
+                }
+            }
+        }
+
+        // Handle missing ALT allele as deletion.
         if raw_alt.is_empty() {
             if pos > 1 {
                 let left_base = fasta.fetch_seq(&fasta_contig, pos - 2, pos - 1)?.to_ascii_uppercase();
@@ -347,7 +315,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Normalize the variant (left‑normalization).
         let (norm_pos, norm_ref, norm_alt) =
             match normalize_variant(&fasta_contig, pos, &raw_ref, &raw_alt, &fasta) {
                 Ok(v) => v,
@@ -361,7 +328,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut vcf_record = writer.empty_record();
         let rid = writer.header().name2rid(vcf_chrom.as_bytes())?;
         vcf_record.set_rid(Some(rid));
-        // VCF positions are 0‑based.
         vcf_record.set_pos((norm_pos - 1) as i64);
         let _ = vcf_record.set_id(var_id.as_bytes());
         if let Err(e) = vcf_record.set_alleles(&[norm_ref.as_bytes(), norm_alt.as_bytes()]) {
